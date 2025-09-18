@@ -66,12 +66,13 @@ def judge_stability(
     min_runs: int = 6,
     rel_tol: float = 0.02,         # 2% relative half-width target
     abs_tol_ms: float = 0.10,      # or ≤ 0.10 ms absolute half-width
-    fence_k: float = 1.5,          # Tukey fence multiplier
+    fence_k: float = 1.0,          # Tukey fence multiplier
     alpha: float = 0.05,
     bootstrap_B: int = 10_000,
     bootstrap_seed: int | None = 12345
 ) -> StabilityResult:
-    """Return whether runtimes are stable enough and a robust estimate if so."""
+    """Return whether runtimes are stable enough and a robust estimate if so.
+    Allowed instability increases with number of runs, so early abort if very stable."""
     xs = [float(x) for x in times_ms if math.isfinite(x) and x > 0]
     n_input = len(xs)
     if n_input < 2:
@@ -104,22 +105,22 @@ def judge_stability(
     ci_lo, ci_hi = _bootstrap_ci_median(trimmed, alpha=alpha, B=bootstrap_B, seed=bootstrap_seed)
     half_width = (ci_hi - ci_lo) / 2.0
 
-    # Decision: accept if CI half-width is small enough relative to estimate or absolutely
-    rel_ok = (median > 0) and (half_width / median <= rel_tol)
+    # Adjust allowed instability with number of runs (early abort if very stable)
+    rel_tol_eff = rel_tol * math.sqrt(n / min_runs)
+    rel_ok = (median > 0) and (half_width / median <= rel_tol_eff)
     abs_ok = (half_width <= abs_tol_ms)
 
     if rel_ok or abs_ok:
         return StabilityResult(True, median, half_width, (ci_lo, ci_hi), n_input, n, removed, cv_pct, mad,
-                               f"Stable: half-width {half_width:.4f} ms (rel {half_width/median*100:.2f}%); "
+                               f"Stable: half-width {half_width:.4f} ms (rel {half_width/median*100:.2f}%, allowed {rel_tol_eff*100:.2f}%); "
                                f"n={n}, outliers removed={removed}")
     else:
         # Give a concrete suggestion for more runs: estimate needed n scaling for width ~ 1/sqrt(n)
-        # Bootstrap CI width tends to shrink ~sqrt(n); propose multiplier to hit target
-        target_half = max(rel_tol * median, abs_tol_ms)
+        target_half = max(rel_tol_eff * median, abs_tol_ms)
         suggested_n = math.ceil(n * (half_width / target_half) ** 2)
         suggested_n = max(suggested_n, n + 2)  # at least a few more
         return StabilityResult(False, None, None, (ci_lo, ci_hi), n_input, n, removed, cv_pct, mad,
-                               f"Not stable: half-width {half_width:.4f} ms (rel {half_width/median*100:.2f}%). "
+                               f"Not stable: half-width {half_width:.4f} ms (rel {half_width/median*100:.2f}%, allowed {rel_tol_eff*100:.2f}%). "
                                f"Try ~{suggested_n} total runs.")
 
 
@@ -279,18 +280,31 @@ with Runner() as runner:
         execution_times = []
         compilation_times = []
         for i in range(200):
+            start_time = time.time()
             execution_time, compilation_time, client_total = runner.execute(query)
+            elapsed = time.time() - start_time
+            print(f"Runner took {elapsed*1000:.2f} ms for query {query_file} run {i+1}")
+
             # print(f"Run: Execution Time: {execution_time} ms\nCompilation Time: {compilation_time} ms\nClient Total Time: {client_total} ms\n")
             execution_times.append(execution_time)
             compilation_times.append(compilation_time)
+
+            start_time = time.time()
             judged_execution_times = judge_stability(
                 execution_times,
                 rel_tol=0.02,
             )
+            elapsed = time.time() - start_time
+            print(f"Judge exec took {elapsed*1000:.2f} ms for query {query_file} run {i+1} => {judged_execution_times.stable} ({judged_execution_times.plus_minus_ms})")
+
+            start_time = time.time()
             judged_compilation_times = judge_stability(
                 compilation_times,
                 rel_tol=0.02,
             )
+            elapsed = time.time() - start_time
+            print(f"Judge comp took {elapsed*1000:.2f} ms for query {query_file} run {i+1} => {judged_compilation_times.stable} ({judged_compilation_times.plus_minus_ms})")
+
             if judged_execution_times.stable and judged_compilation_times.stable:
                 results["queries"][query_file.replace(".sql","")] = {
                     "execution_times": execution_times,
